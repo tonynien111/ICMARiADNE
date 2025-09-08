@@ -11,6 +11,7 @@ from model import PolicyNet, QNet
 from runner import RLRunner
 from parameter import *
 from icm import ICMAgent
+from behavior_cloning import run_behavior_cloning
 
 ray.init()
 print("Welcome to RL autonomous exploration!")
@@ -43,6 +44,16 @@ def main():
     if USE_ICM:
         global_icm_agent = ICMAgent(NODE_INPUT_DIM, EMBEDDING_DIM, ICM_ACTION_DIM, device)
         global_icm_optimizer = optim.Adam(global_icm_agent.icm.parameters(), lr=ICM_LR)
+
+    # Behavior cloning pretraining
+    if USE_BEHAVIOR_CLONING and not LOAD_MODEL:
+        print("Starting behavior cloning pretraining...")
+        bc_success = run_behavior_cloning(global_policy_net, device, writer)
+        if bc_success:
+            print("Behavior cloning pretraining completed successfully!")
+        else:
+            print("Behavior cloning failed, continuing with random initialization...")
+        print("-" * 60)
 
     # initialize optimizers
     global_policy_optimizer = optim.Adam(global_policy_net.parameters(), lr=LR)

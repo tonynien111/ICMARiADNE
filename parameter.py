@@ -63,6 +63,18 @@ VAL_SPLIT = 0.2    # 20% for validation
 TEST_SPLIT = 0.2   # 20% for testing
 RANDOM_SEED = 42   # for reproducible splits
 
+# Behavior Cloning parameters
+USE_BEHAVIOR_CLONING = True  # enable behavior cloning pretraining
+EXPERT_EPISODES = 50  # number of expert episodes to collect
+BC_EPOCHS = 100  # number of behavior cloning epochs
+BC_BATCH_SIZE = 64  # batch size for behavior cloning
+BC_LR = 1e-4  # learning rate for behavior cloning
+BC_VALIDATION_SPLIT = 0.2  # validation split for early stopping
+BC_PATIENCE = 10  # early stopping patience
+BC_DEMONSTRATIONS_PATH = 'expert_demonstrations.pkl'  # path to save/load demonstrations
+BC_COLLECT_DATA_ON_START = True  # collect expert data at start if not found
+BC_MAX_STEPS_PER_EPISODE = 50  # maximum steps per expert episode
+
 # GPU usage
 USE_GPU = False  # do you want to collect training data using GPUs (better not)
 USE_GPU_GLOBAL = False  # do you want to train the network using GPUs - set to False for CPU-only
