@@ -1,6 +1,7 @@
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import ray
 import os
@@ -11,7 +12,9 @@ from model import PolicyNet, QNet
 from runner import RLRunner
 from parameter import *
 from icm import ICMAgent
-from behavior_cloning import run_behavior_cloning
+from expert.behavior_cloning import run_behavior_cloning
+from expert.expert_data_collector import ExpertDataCollector
+import pickle
 
 ray.init()
 print("Welcome to RL autonomous exploration!")
@@ -45,14 +48,50 @@ def main():
         global_icm_agent = ICMAgent(NODE_INPUT_DIM, EMBEDDING_DIM, ICM_ACTION_DIM, device)
         global_icm_optimizer = optim.Adam(global_icm_agent.icm.parameters(), lr=ICM_LR)
 
-    # Behavior cloning pretraining
-    if USE_BEHAVIOR_CLONING and not LOAD_MODEL:
+    # Behavior cloning pretraining (optional, deprecated in favor of loss integration)
+    if USE_BC_PRETRAINING and not LOAD_MODEL:
         print("Starting behavior cloning pretraining...")
         bc_success = run_behavior_cloning(global_policy_net, device, writer)
         if bc_success:
             print("Behavior cloning pretraining completed successfully!")
         else:
             print("Behavior cloning failed, continuing with random initialization...")
+        print("-" * 60)
+    
+    # Load expert demonstrations for BC loss integration
+    expert_buffer = []
+    if USE_BEHAVIOR_CLONING:
+        print("Loading expert demonstrations for BC loss integration...")
+        collector = ExpertDataCollector(device=local_device)
+        
+        if BC_COLLECT_DATA_ON_START or not os.path.exists(BC_DEMONSTRATIONS_PATH):
+            print("Collecting new expert demonstrations...")
+            expert_demonstrations = collector.collect_expert_demonstrations(
+                num_episodes=EXPERT_EPISODES,
+                save_path=BC_DEMONSTRATIONS_PATH
+            )
+        else:
+            print(f"Loading existing demonstrations from {BC_DEMONSTRATIONS_PATH}")
+            try:
+                with open(BC_DEMONSTRATIONS_PATH, 'rb') as f:
+                    expert_demonstrations = pickle.load(f)
+            except:
+                print("Failed to load demonstrations, collecting new ones...")
+                expert_demonstrations = collector.collect_expert_demonstrations(
+                    num_episodes=EXPERT_EPISODES,
+                    save_path=BC_DEMONSTRATIONS_PATH
+                )
+        
+        # Convert expert demonstrations to buffer format
+        for demo in expert_demonstrations:
+            expert_buffer.append(demo)
+        
+        print(f"Loaded {len(expert_buffer)} expert demonstrations")
+        
+        # Limit buffer size
+        if len(expert_buffer) > BC_EXPERT_BUFFER_SIZE:
+            expert_buffer = expert_buffer[:BC_EXPERT_BUFFER_SIZE]
+        
         print("-" * 60)
 
     # initialize optimizers
@@ -219,9 +258,66 @@ def main():
                         q_values = torch.min(q_values1, q_values2)
 
                     logp = dp_policy(*observation)
-                    policy_loss = torch.sum(
+                    
+                    # Standard SAC policy loss
+                    sac_policy_loss = torch.sum(
                         (logp.exp().unsqueeze(2) * (log_alpha.exp().detach() * logp.unsqueeze(2) - q_values.detach())),
                         dim=1).mean()
+                    
+                    # Behavior Cloning loss component
+                    bc_loss = torch.tensor(0.0, device=device)
+                    bc_weight = 0.0
+                    
+                    if USE_BEHAVIOR_CLONING and len(expert_buffer) > 0:
+                        bc_weight = get_bc_loss_weight(curr_episode)
+                        if bc_weight > 0:
+                            try:
+                                # Sample expert demonstrations
+                                expert_batch_size = max(1, int(BATCH_SIZE * BC_EXPERT_SAMPLE_RATIO))
+                                expert_sample = sample_expert_batch(expert_buffer, expert_batch_size, device)
+                                
+                                if expert_sample is not None:
+                                    expert_obs, expert_actions = expert_sample
+                                    
+                                    # Validate expert_actions tensor
+                                    if expert_actions.dim() != 1:
+                                        print(f"Warning: expert_actions has wrong dimensions: {expert_actions.shape}")
+                                        expert_actions = expert_actions.flatten()
+                                    
+                                    # Get policy predictions on expert observations
+                                    expert_logp = dp_policy(*expert_obs)
+                                    
+                                    # Validate logp tensor
+                                    if expert_logp.dim() != 2:
+                                        print(f"Warning: expert_logp has wrong dimensions: {expert_logp.shape}")
+                                        continue
+                                    
+                                    # Ensure actions are within valid range
+                                    max_action = expert_logp.shape[-1] - 1
+                                    if expert_actions.max() > max_action or expert_actions.min() < 0:
+                                        print(f"Warning: expert actions out of range [0, {max_action}]: {expert_actions}")
+                                        # Clamp actions to valid range
+                                        expert_actions = torch.clamp(expert_actions, 0, max_action)
+                                    
+                                    # Calculate cross-entropy loss
+                                    bc_loss = F.cross_entropy(expert_logp, expert_actions)
+                                    
+                                    # Validate BC loss
+                                    if torch.isnan(bc_loss) or torch.isinf(bc_loss):
+                                        print(f"Warning: Invalid BC loss: {bc_loss}")
+                                        bc_loss = torch.tensor(0.0, device=device)
+                                        bc_weight = 0.0
+                                else:
+                                    print("Warning: Failed to sample expert batch")
+                            except Exception as e:
+                                print(f"Error in BC loss calculation: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                bc_loss = torch.tensor(0.0, device=device)
+                                bc_weight = 0.0
+                    
+                    # Combined policy loss
+                    policy_loss = sac_policy_loss + bc_weight * bc_loss
 
                     global_policy_optimizer.zero_grad()
                     policy_loss.backward()
@@ -303,15 +399,16 @@ def main():
                 for n in metric_name:
                     perf_data.append(np.nanmean(perf_metrics[n]))
                 
-                # seeting icm 
+                # setting data for tensorboard
                 if USE_ICM:
-                    data = [reward.mean().item(), value_prime.mean().item(), policy_loss.item(), q1_loss.item(),
-                            entropy.mean().item(), policy_grad_norm.item(), q_grad_norm.item(), log_alpha.item(),
-                            alpha_loss.item(), icm_inverse_loss.item(), icm_forward_loss.item(), *perf_data]
+                    data = [reward.mean().item(), value_prime.mean().item(), policy_loss.item(), sac_policy_loss.item(),
+                            bc_loss.item(), bc_weight, q1_loss.item(), entropy.mean().item(), policy_grad_norm.item(), 
+                            q_grad_norm.item(), log_alpha.item(), alpha_loss.item(), icm_inverse_loss.item(), 
+                            icm_forward_loss.item(), *perf_data]
                 else:
-                    data = [reward.mean().item(), value_prime.mean().item(), policy_loss.item(), q1_loss.item(),
-                            entropy.mean().item(), policy_grad_norm.item(), q_grad_norm.item(), log_alpha.item(),
-                            alpha_loss.item(), *perf_data]
+                    data = [reward.mean().item(), value_prime.mean().item(), policy_loss.item(), sac_policy_loss.item(),
+                            bc_loss.item(), bc_weight, q1_loss.item(), entropy.mean().item(), policy_grad_norm.item(), 
+                            q_grad_norm.item(), log_alpha.item(), alpha_loss.item(), *perf_data]
                 training_data.append(data)
 
             # write record to tensorboard
@@ -378,6 +475,104 @@ def main():
             ray.kill(a)
 
 
+def get_bc_loss_weight(curr_episode):
+    """Calculate behavior cloning loss weight with decay"""
+    if curr_episode >= BC_LOSS_DECAY_EPISODES:
+        return BC_LOSS_WEIGHT_FINAL
+    
+    # Linear decay from initial to final weight
+    decay_ratio = curr_episode / BC_LOSS_DECAY_EPISODES
+    weight = BC_LOSS_WEIGHT_INITIAL * (1 - decay_ratio) + BC_LOSS_WEIGHT_FINAL * decay_ratio
+    return weight
+
+def sample_expert_batch(expert_buffer, batch_size, device):
+    """Sample a batch from expert demonstrations"""
+    if len(expert_buffer) == 0:
+        return None
+    
+    # Sample random demonstrations
+    sample_size = min(batch_size, len(expert_buffer))
+    sampled_demos = random.sample(expert_buffer, sample_size)
+    
+    # Convert to batch format matching RL training data
+    observations = []
+    actions = []
+    
+    for demo in sampled_demos:
+        # Extract observation components
+        obs = demo['observation']
+        action = demo['action']
+        
+        observations.append(obs)
+        actions.append(action)
+    
+    # Stack observations into tensors with proper dimension handling
+    if len(observations) > 0:
+        try:
+            # Helper function to properly handle tensor dimensions
+            def process_obs_tensor(tensor_list, target_dims, target_shape=None):
+                processed = []
+                for tensor in tensor_list:
+                    # Ensure tensor is on CPU first for processing
+                    if tensor.device != torch.device('cpu'):
+                        tensor = tensor.cpu()
+                    
+                    # Remove extra batch dimensions by repeatedly squeezing dimension 0 if it's size 1
+                    while tensor.dim() > target_dims and tensor.shape[0] == 1:
+                        tensor = tensor.squeeze(0)
+                    
+                    # Ensure we have the right number of dimensions
+                    while tensor.dim() < target_dims:
+                        tensor = tensor.unsqueeze(0)
+                    
+                    # For current_index, ensure all tensors have same shape
+                    if target_shape is not None:
+                        # Reshape to target shape
+                        if tensor.numel() == np.prod(target_shape):
+                            tensor = tensor.reshape(target_shape)
+                        else:
+                            # If can't reshape, take first element and create target shape
+                            first_elem = tensor.flatten()[0] if tensor.numel() > 0 else 0
+                            tensor = torch.full(target_shape, first_elem, dtype=tensor.dtype)
+                    
+                    processed.append(tensor)
+                
+                return torch.stack(processed).to(device)
+            
+            # Process each observation component with expected dimensions
+            node_inputs = process_obs_tensor([obs[0] for obs in observations], 2)  # [nodes, features]
+            node_padding_mask = process_obs_tensor([obs[1] for obs in observations], 2)  # [1, nodes]
+            edge_mask = process_obs_tensor([obs[2] for obs in observations], 2)  # [nodes, nodes]
+            current_index = process_obs_tensor([obs[3] for obs in observations], 1, target_shape=(1,))  # [1]
+            current_edge = process_obs_tensor([obs[4] for obs in observations], 2)  # [k_size, 1]
+            edge_padding_mask = process_obs_tensor([obs[5] for obs in observations], 2)  # [1, k_size]
+            
+            # Process actions - ensure they're scalars (1D tensor with single element)
+            processed_actions = []
+            for action in actions:
+                if torch.is_tensor(action):
+                    # Convert to scalar if needed
+                    if action.numel() == 1:
+                        processed_actions.append(action.item())
+                    else:
+                        processed_actions.append(action.flatten()[0].item())
+                else:
+                    processed_actions.append(int(action))
+            
+            # Convert to tensor of action indices (1D tensor for cross-entropy)
+            actions_tensor = torch.tensor(processed_actions, dtype=torch.long, device=device)
+            
+            batch_observation = [node_inputs, node_padding_mask, edge_mask, current_index, current_edge, edge_padding_mask]
+            return batch_observation, actions_tensor
+            
+        except Exception as e:
+            print(f"Error sampling expert batch: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    return None
+
 def write_to_tensor_board(writer, tensorboard_data, curr_episode):
     # each row in tensorboardData represents an episode
     # each column is a specific metric
@@ -386,14 +581,17 @@ def write_to_tensor_board(writer, tensorboard_data, curr_episode):
     tensorboard_data = list(np.nanmean(tensorboard_data, axis=0))
     
     if USE_ICM:
-        reward, value, policy_loss, q_value_loss, entropy, policy_grad_norm, q_value_grad_norm, log_alpha, alpha_loss, icm_inverse_loss, icm_forward_loss, travel_dist, success_rate, explored_rate = tensorboard_data
+        reward, value, policy_loss, sac_policy_loss, bc_loss, bc_weight, q_value_loss, entropy, policy_grad_norm, q_value_grad_norm, log_alpha, alpha_loss, icm_inverse_loss, icm_forward_loss, travel_dist, success_rate, explored_rate = tensorboard_data
         writer.add_scalar(tag='ICM/Inverse Loss', scalar_value=icm_inverse_loss, global_step=curr_episode)
         writer.add_scalar(tag='ICM/Forward Loss', scalar_value=icm_forward_loss, global_step=curr_episode)
     else:
-        reward, value, policy_loss, q_value_loss, entropy, policy_grad_norm, q_value_grad_norm, log_alpha, alpha_loss, travel_dist, success_rate, explored_rate = tensorboard_data
+        reward, value, policy_loss, sac_policy_loss, bc_loss, bc_weight, q_value_loss, entropy, policy_grad_norm, q_value_grad_norm, log_alpha, alpha_loss, travel_dist, success_rate, explored_rate = tensorboard_data
 
     writer.add_scalar(tag='Losses/Value', scalar_value=value, global_step=curr_episode)
-    writer.add_scalar(tag='Losses/Policy Loss', scalar_value=policy_loss, global_step=curr_episode)
+    writer.add_scalar(tag='Losses/Policy Loss (Total)', scalar_value=policy_loss, global_step=curr_episode)
+    writer.add_scalar(tag='Losses/SAC Policy Loss', scalar_value=sac_policy_loss, global_step=curr_episode)
+    writer.add_scalar(tag='Losses/BC Loss', scalar_value=bc_loss, global_step=curr_episode)
+    writer.add_scalar(tag='Losses/BC Weight', scalar_value=bc_weight, global_step=curr_episode)
     writer.add_scalar(tag='Losses/Alpha Loss', scalar_value=alpha_loss, global_step=curr_episode)
     writer.add_scalar(tag='Losses/Q Value Loss', scalar_value=q_value_loss, global_step=curr_episode)
     writer.add_scalar(tag='Losses/Entropy', scalar_value=entropy, global_step=curr_episode)

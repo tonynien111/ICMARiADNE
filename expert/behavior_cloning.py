@@ -224,15 +224,15 @@ def run_behavior_cloning(policy_net, device='cpu', tensorboard_writer=None):
     collector = ExpertDataCollector(device=device)
     
     # Load or collect expert demonstrations
-    if os.path.exists(BC_DEMONSTRATIONS_PATH):
-        print(f"Loading existing demonstrations from {BC_DEMONSTRATIONS_PATH}")
-        expert_demonstrations = collector.load_demonstrations(BC_DEMONSTRATIONS_PATH)
-    else:
-        print("No existing demonstrations found. Collecting new ones...")
+    if BC_COLLECT_DATA_ON_START or not os.path.exists(BC_DEMONSTRATIONS_PATH):
+        print("Collecting new expert demonstrations...")
         expert_demonstrations = collector.collect_expert_demonstrations(
-            num_episodes=EXPERT_EPISODES, 
+            num_episodes=EXPERT_EPISODES,
             save_path=BC_DEMONSTRATIONS_PATH
         )
+    else:
+        print(f"Loading existing demonstrations from {BC_DEMONSTRATIONS_PATH}")
+        expert_demonstrations = collector.load_demonstrations(BC_DEMONSTRATIONS_PATH)
     
     if len(expert_demonstrations) == 0:
         print("ERROR: No expert demonstrations available!")
