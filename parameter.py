@@ -56,32 +56,18 @@ ICM_ETA_MAX = 0.05   # maximum ICM weight when unexplored
 ICM_EXPLORATION_THRESHOLD = 0.8  # exploration rate threshold for adaptive scaling
 ICM_ACTION_DIM = K_SIZE  # action dimension for ICM (same as K_SIZE)
 
+USE_BC = True  # enable behavior cloning as auxiliary loss
+BC_WEIGHT = 0.1  # weight for behavior cloning loss in combined loss
+BC_SCHEDULE = "constant"  # "constant", "linear_decay", "exponential_decay"
+BC_DECAY_RATE = 0.0001  # decay rate for BC weight scheduling
+BC_MIN_WEIGHT = 0.01  # minimum BC weight when using decay schedules
+BC_EXPERT_RATIO = 0.3  # ratio of expert actions in experience buffer
 # Data split parameters
 DATA_SPLIT_MODE = 'train'  # 'train', 'val', 'test' - which dataset to use
 TRAIN_SPLIT = 0.6  # 60% for training
 VAL_SPLIT = 0.2    # 20% for validation  
 TEST_SPLIT = 0.2   # 20% for testing
 RANDOM_SEED = 42   # for reproducible splits
-
-# Behavior Cloning parameters
-USE_BEHAVIOR_CLONING = True  # enable behavior cloning as loss component
-USE_BC_PRETRAINING = False  # enable separate behavior cloning pretraining (deprecated)
-EXPERT_EPISODES = 50  # number of expert episodes to collect
-BC_EPOCHS = 100  # number of behavior cloning epochs (for pretraining only)
-BC_BATCH_SIZE = 64  # batch size for behavior cloning (for pretraining only)
-BC_LR = 1e-4  # learning rate for behavior cloning (for pretraining only)
-BC_VALIDATION_SPLIT = 0.2  # validation split for early stopping (for pretraining only)
-BC_PATIENCE = 10  # early stopping patience (for pretraining only)
-BC_DEMONSTRATIONS_PATH = 'expert_demonstrations.pkl'  # path to save/load demonstrations
-BC_COLLECT_DATA_ON_START = True  # collect expert data at start if not found
-BC_MAX_STEPS_PER_EPISODE = 50  # maximum steps per expert episode
-
-# BC Loss Integration parameters
-BC_LOSS_WEIGHT_INITIAL = 1.0  # initial weight for BC loss component
-BC_LOSS_WEIGHT_FINAL = 0.1  # final weight for BC loss component
-BC_LOSS_DECAY_EPISODES = 1000  # episodes over which to decay BC loss weight
-BC_EXPERT_BUFFER_SIZE = 5000  # size of expert demonstration replay buffer
-BC_EXPERT_SAMPLE_RATIO = 0.3  # ratio of expert samples in each training batch
 
 # GPU usage
 USE_GPU = False  # do you want to collect training data using GPUs (better not)

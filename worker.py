@@ -5,6 +5,7 @@ from agent import Agent
 from utils import *
 from model import PolicyNet
 from icm import ICMAgent
+from expert.expert_action_generator import ExpertActionGenerator
 
 if not os.path.exists(gifs_path):
     os.makedirs(gifs_path)
@@ -23,11 +24,20 @@ class Worker:
         # ICM integration
         self.icm_agent = icm_agent
         self.use_icm = USE_ICM and icm_agent is not None
+        
+        # BC integration
+        self.expert_action_generator = ExpertActionGenerator(self.robot.node_manager, self.device)
+        self.use_bc = USE_BC
 
         self.episode_buffer = []
         self.perf_metrics = dict()
-        # Add buffer for intrinsic rewards (index 15)
-        buffer_size = 16 if self.use_icm else 15
+        # Add buffer for expert actions and intrinsic rewards
+        # Base: 15, +1 for ICM intrinsic rewards, +1 for BC expert actions
+        buffer_size = 15
+        if self.use_icm:
+            buffer_size += 1  # index 15 for intrinsic rewards
+        if self.use_bc:
+            buffer_size += 1  # index 16 (or 15 if no ICM) for expert actions
         for i in range(buffer_size):
             self.episode_buffer.append([])
 
@@ -35,6 +45,10 @@ class Worker:
         done = False
         self.robot.update_planning_state(self.env.belief_info, self.env.robot_location)
         observation = self.robot.get_observation()
+        
+        # Reset expert path at episode start
+        if self.use_bc:
+            self.expert_action_generator.reset_expert_path()
 
         if self.save_image:
             self.robot.plot_env()
@@ -46,6 +60,14 @@ class Worker:
 
             next_location, action_index = self.robot.select_next_waypoint(observation)
             self.save_action(action_index)
+            
+            # Get expert action for BC
+            expert_action_index = None
+            if self.use_bc:
+                expert_action_index, is_expert_available = self.expert_action_generator.get_expert_action(
+                    observation, self.env.robot_location, self.robot.node_manager
+                )
+                self.save_expert_action(expert_action_index)
 
             node = self.robot.node_manager.nodes_dict.find((self.robot.location[0], self.robot.location[1]))
             check = np.array(list(node.data.neighbor_set)).reshape(-1, 2)
@@ -99,6 +121,13 @@ class Worker:
         self.perf_metrics['travel_dist'] = self.env.travel_dist
         self.perf_metrics['explored_rate'] = self.env.explored_rate
         self.perf_metrics['success_rate'] = done
+        
+        # Calculate average intrinsic reward for this episode
+        if self.use_icm and len(self.episode_buffer) > 15 and len(self.episode_buffer[15]) > 0:
+            avg_intrinsic_reward = sum([r.item() for r in self.episode_buffer[15]]) / len(self.episode_buffer[15])
+            self.perf_metrics['intrinsic_reward'] = avg_intrinsic_reward
+        else:
+            self.perf_metrics['intrinsic_reward'] = 0.0
 
         # save gif
         if self.save_image:
@@ -115,6 +144,22 @@ class Worker:
 
     def save_action(self, action_index):
         self.episode_buffer[6] += action_index.reshape(1, 1, 1)
+    
+    def save_expert_action(self, expert_action_index):
+        """Save expert action for behavior cloning"""
+        if self.use_bc:
+            if expert_action_index is not None:
+                expert_action = expert_action_index.reshape(1, 1, 1)
+            else:
+                # Use -1 to indicate no expert action available
+                expert_action = torch.tensor([[-1]]).reshape(1, 1, 1).to(self.device)
+            
+            # Calculate buffer index: base 15, +1 for ICM if enabled
+            buffer_idx = 15
+            if self.use_icm:
+                buffer_idx += 1  # Expert actions go to index 16 if ICM is enabled
+                
+            self.episode_buffer[buffer_idx] += expert_action
 
     def save_reward_done(self, reward, done, intrinsic_reward=0.0):
         self.episode_buffer[7] += torch.FloatTensor([reward]).reshape(1, 1, 1).to(self.device)
